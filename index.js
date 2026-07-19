@@ -1,6 +1,7 @@
 // Smart Web Search - SillyTavern extension
 // Gives your local model live web results, either on every message or only
-// when a message looks like it needs current/real-world info.
+// when a message looks like it needs current/real-world info OR references
+// something the model likely doesn't know well (not just "recent" things).
 
 import { extension_settings } from "../../../extensions.js";
 import { saveSettingsDebounced, generateQuietPrompt } from "../../../../script.js";
@@ -16,7 +17,10 @@ const defaultSettings = {
     serpapiKey: "",              // only used if backend === "serpapi" (NOT recommended, see README)
     resultCount: 4,
     knowledgeCutoffYear: 2023,   // set this to your model's training cutoff year
-    aiAssist: false,             // ask the local model to judge ambiguous messages (slower, more accurate)
+    // AI-assist now does two jobs: (1) catches things the keyword list misses,
+    // like niche topics/entities that aren't about "recency" at all, and
+    // (2) is used to produce a clean search query when it fires. Recommended on.
+    aiAssist: true,
     timeoutMs: 6000,
     cacheMinutes: 10,
     debug: false,
@@ -31,6 +35,33 @@ const TIME_KEYWORDS = [
     "who is the current", "who is the ceo", "who is the president",
     "election", "score", "stock price", "exchange rate", "weather in",
 ];
+
+// Used only to clean up a query for the FAST heuristic path (no extra LLM
+// call). The AI-assist path does its own, smarter query extraction.
+const FILLER_PREFIXES = [
+    /^(bro|dude|yo+|hey|hi|so|okay|ok|um+|uh+|hmm+|man|listen|look|well)[,!.]?\s+/i,
+];
+const WRAPPER_PHRASES = [
+    /\bhave you heard about\b/gi,
+    /\bdo you know about\b/gi,
+    /\bwhat do you know about\b/gi,
+    /\bcan you tell me about\b/gi,
+    /\btell me about\b/gi,
+];
+
+function cleanQueryHeuristic(text) {
+    let q = text.trim();
+    let prev;
+    do {
+        prev = q;
+        for (const re of FILLER_PREFIXES) q = q.replace(re, "");
+    } while (q !== prev);
+    q = q.replace(/\([^)]*\)/g, " ");                 // drop parentheticals
+    for (const re of WRAPPER_PHRASES) q = q.replace(re, " ");
+    q = q.replace(/\s+/g, " ").trim();
+    q = q.replace(/[?!.,]+$/g, "").trim();
+    return q || text.trim();
+}
 
 const searchCache = new Map(); // query -> { text, ts }
 
@@ -55,7 +86,7 @@ function log(...args) {
     if (getSettings().debug) console.log(`[${extensionName}]`, ...args);
 }
 
-// --- Heuristic "does this need a search" check -----------------------------
+// --- Fast heuristic: obviously time-sensitive stuff, no LLM call needed ----
 
 function heuristicNeedsSearch(text, settings) {
     if (!text) return false;
@@ -75,18 +106,35 @@ function heuristicNeedsSearch(text, settings) {
     return false;
 }
 
-async function aiAssistNeedsSearch(text) {
+// --- AI-assist: catches everything the keyword list can't, because it's
+// not about recency at all - it's "do I actually know this topic well?"
+// Also doubles as query extraction so we don't need a second LLM call. -----
+
+async function aiAnalyzeMessage(text) {
+    const prompt =
+        `User message: "${text}"\n\n` +
+        `Decide whether answering this well would require looking something up - ` +
+        `specific facts, named people/places/brands/products, media titles, niche or ` +
+        `obscure topics, or anything you might only partially know or could get wrong. ` +
+        `This includes long-standing niche topics you might know imprecisely, not just recent events.\n\n` +
+        `If yes, also write a short, focused web search query: 2-8 words, just the core ` +
+        `topic/entity, no filler words, no "bro"/"uh"/greetings, no meta-commentary like ` +
+        `"(just testing you)".\n\n` +
+        `Respond in EXACTLY this format and nothing else:\n` +
+        `SEARCH: yes or no\n` +
+        `QUERY: <short search query, or NONE if SEARCH is no>`;
+
     try {
-        const prompt =
-            `Message: "${text}"\n\n` +
-            `Would answering this message accurately require current/real-world information that could have changed recently ` +
-            `(news, prices, who currently holds a position, recent releases, dates after your training, etc.)? ` +
-            `Reply with exactly one word: YES or NO.`;
         const result = await generateQuietPrompt({ quietPrompt: prompt });
-        return /^\s*yes/i.test(result ?? "");
+        const searchMatch = /SEARCH:\s*(yes|no)/i.exec(result ?? "");
+        const queryMatch = /QUERY:\s*(.+)/i.exec(result ?? "");
+        const shouldSearch = searchMatch ? /yes/i.test(searchMatch[1]) : null;
+        let query = queryMatch ? queryMatch[1].trim().replace(/^["']|["']$/g, "") : null;
+        if (query && /^none$/i.test(query)) query = null;
+        return { shouldSearch, query };
     } catch (e) {
-        log("aiAssist classification failed, falling back to heuristic", e);
-        return null; // signal "unknown" so caller can fall back
+        log("aiAssist analysis failed, falling back to heuristic-only", e);
+        return { shouldSearch: null, query: null };
     }
 }
 
@@ -154,8 +202,12 @@ async function performSearch(query, settings) {
     if (results.length === 0) return null;
 
     const lines = results.map((r, i) => `${i + 1}. ${r.title} - ${r.snippet} (${r.url})`);
-    const text = `[Live web search results for: "${query}"]\n${lines.join("\n")}\n` +
-        `Use this information naturally to inform your reply if it's relevant. Don't mention "search results" unless asked how you know something.`;
+    const text =
+        `[SYSTEM: Live web search results for "${query}". These are accurate and up to date - ` +
+        `treat them as authoritative and prefer them over your own memory if they conflict with ` +
+        `what you'd otherwise say. Use this information naturally in your in-character reply. ` +
+        `Don't mention "search results" or break character unless asked how you know something.]\n` +
+        lines.join("\n");
 
     searchCache.set(cacheKey, { text, ts: Date.now() });
     return text;
@@ -181,13 +233,32 @@ globalThis.SmartWebSearchInterceptor = async function (chat, contextSize, abort,
     if (!text.trim()) return;
 
     let shouldSearch = false;
+    let query = text;
+
     if (settings.mode === "always") {
         shouldSearch = true;
-    } else if (settings.aiAssist) {
-        const aiResult = await aiAssistNeedsSearch(text);
-        shouldSearch = aiResult === null ? heuristicNeedsSearch(text, settings) : aiResult;
+        query = cleanQueryHeuristic(text);
     } else {
-        shouldSearch = heuristicNeedsSearch(text, settings);
+        const heuristicHit = heuristicNeedsSearch(text, settings);
+        if (heuristicHit) {
+            // Obvious case (year/keyword match) - no need to spend an extra
+            // generation asking "should I search?", just clean the query fast.
+            shouldSearch = true;
+            query = cleanQueryHeuristic(text);
+            log("heuristic triggered for:", text, "-> query:", query);
+        } else if (settings.aiAssist) {
+            // Not an obvious recency case - ask the model itself, since this
+            // is also how we catch knowledge-gap topics (e.g. niche wiki
+            // entries) that no keyword list could anticipate.
+            const analysis = await aiAnalyzeMessage(text);
+            if (analysis.shouldSearch === true) {
+                shouldSearch = true;
+                query = analysis.query || cleanQueryHeuristic(text);
+                log("aiAssist triggered for:", text, "-> query:", query);
+            } else {
+                log("aiAssist declined to search for:", text);
+            }
+        }
     }
 
     if (!shouldSearch) {
@@ -196,7 +267,7 @@ globalThis.SmartWebSearchInterceptor = async function (chat, contextSize, abort,
     }
 
     try {
-        const resultText = await performSearch(text, settings);
+        const resultText = await performSearch(query, settings);
         if (!resultText) return;
 
         const note = {
@@ -208,14 +279,13 @@ globalThis.SmartWebSearchInterceptor = async function (chat, contextSize, abort,
             extra: { isSmallSys: true },
         };
         chat.splice(chat.length - 1, 0, note);
-        log("injected search results for:", text);
+        log("injected search results, query was:", query);
     } catch (e) {
         console.warn(`[${extensionName}] search failed, continuing without it:`, e);
     }
 };
 
-// --- Settings panel (built inline, matches the "always visible in the
-// Extensions tab" pattern) ---------------------------------------------------
+// --- Settings panel -----------------------------------------------------------
 
 function buildSettingsPanel() {
     const settings = getSettings();
@@ -244,7 +314,7 @@ function buildSettingsPanel() {
                 <label>Search backend</label>
                 <select id="sws_backend" class="text_pole">
                     <option value="plugin">Server plugin (recommended, fastest, no CORS issues)</option>
-                    <option value="searxng">Direct to local SearXNG</option>
+                    <option value="searxng">Direct to local SearXNG (will hit CORS errors)</option>
                     <option value="serpapi">SerpAPI (rate limited, key stored in browser)</option>
                 </select>
 
@@ -262,12 +332,12 @@ function buildSettingsPanel() {
                 <label>Number of results to inject</label>
                 <input id="sws_result_count" type="number" min="1" max="10" class="text_pole" />
 
-                <label>Model's knowledge cutoff year (used by Smart mode)</label>
+                <label>Model's knowledge cutoff year (fast-path heuristic only)</label>
                 <input id="sws_cutoff_year" type="number" min="2000" max="2100" class="text_pole" />
 
                 <label class="checkbox_label">
                     <input id="sws_ai_assist" type="checkbox" />
-                    <span>Use the model itself to judge ambiguous messages (slower, more accurate than keyword-only Smart mode)</span>
+                    <span>AI-assist (recommended): catches niche/obscure topics the keyword list misses, and writes a clean search query instead of using your raw message. Adds one quick extra generation, only when the fast heuristic didn't already decide to search.</span>
                 </label>
 
                 <label class="checkbox_label">
@@ -352,9 +422,6 @@ function buildSettingsPanel() {
 }
 
 // --- Init --------------------------------------------------------------------
-// Same pattern as the LM Studio Log Viewer extension: run directly on jQuery
-// ready instead of relying on a manifest "hooks.activate" entry, so the panel
-// reliably shows up under Extensions regardless of ST version quirks.
 
 jQuery(async () => {
     getSettings();
