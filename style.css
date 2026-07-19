@@ -1,0 +1,20 @@
+#smart_web_search_settings .sws_row {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 6px 0;
+}
+
+#smart_web_search_settings label {
+    margin-top: 8px;
+    display: block;
+}
+
+#smart_web_search_settings #sws_test_output {
+    background: rgba(0, 0, 0, 0.2);
+    border-radius: 6px;
+    padding: 8px;
+    max-height: 200px;
+    overflow-y: auto;
+    font-size: 0.85em;
+}

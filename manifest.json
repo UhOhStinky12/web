@@ -1,0 +1,11 @@
+{
+    "display_name": "Smart Web Search",
+    "loading_order": 10,
+    "js": "index.js",
+    "css": "style.css",
+    "author": "you",
+    "version": "1.0.0",
+    "homePage": "https://github.com/yourname/smart-web-search",
+    "auto_update": true,
+    "generate_interceptor": "SmartWebSearchInterceptor"
+}
